@@ -43,16 +43,30 @@ class xphi(hk.Module):
     def __call__(self, x, h, y, beta):
         
         phi = 0.0
-        l = x, *h
+        l = [x, *h]
 
+        # Bilinear interaction terms between layers
         for i in range(len(self.layers)-1):
             m = self.layers[i]
-            phi = phi + jnp.sum( m( l[i] ) * l[i+1] )
+            z_prev = l[i]
+            z_next = l[i+1]
+            
+            # Stuart-Landau amplitude stabilization per layer
+            # -Σₐ(zₐz̄ₐ - ½(zₐz̄ₐ)²)
+            amplitude = jnp.sum(z_next * jnp.conj(z_next))
+            phi = phi - amplitude + 0.5 * amplitude**2
+            
+            # Coupling term (via weight matrix): sum over W(z_prev)(z̄_next)
+            # This implements -½Jₐᵦ(zᵦ - zₐ)(z̄ᵦ - z̄ₐ) in feedforward form
+            phi = phi + jnp.sum(m(z_prev) * jnp.conj(z_next))
 
+        # Output layer
         logits = self.layers[-1](l[-1])
-        xent = -y*log_softmax(logits)
+        
+        # Complex MSE loss in rotating frame
+        loss = jnp.sum((logits - y) * (jnp.conj(logits) - jnp.conj(y)))
 
-        phi = phi - beta * jnp.sum(xent)
+        phi = phi - beta * loss
 
         return phi, logits
 
@@ -123,7 +137,7 @@ class xp_mlp:
         for t in range(T):
             h, logits = grad(self.jtphi, argnums=3, has_aux=True,
                              holomorphic=holo)(params, None, x, h, y, beta)
-            h = tree_map(self.act, h) 
+            # h = tree_map(self.act, h) 
         
         return h, logits
 
@@ -147,9 +161,9 @@ class xp_mlp:
                              holomorphic=holo)(params, None, x, h, y, beta)
             noise, key = self.init_noise(key)
             noisy_h = tree_map(lambda a, b: a+b, h, noise)
-            h = tree_map(self.act, noisy_h) 
+            # h = tree_map(self.act, noisy_h) 
         
-        return h, logits, key
+        return noisy_h, logits, key
 
     @partial(jit, static_argnums=(0,4))
     def batched_noisy_fwd(self, *args):
@@ -173,7 +187,7 @@ class xp_mlp:
         for t in range(T):
             h, _ = grad(self.jtphi, argnums=3, has_aux=True,
                         holomorphic=holo)(params, None, x, h, y, beta)
-            h = tree_map(self.act, h) 
+            # h = tree_map(self.act, h) 
 
         l2 = self.eval_conv(params, x, y, h, beta, True) 
         dist_h0 = L2(tree_map(lambda a, b: a-b, h0, h))
@@ -385,9 +399,11 @@ class xp_mlp:
     @partial(jit, static_argnums=(0,4))
     def batched_loss(self, params, x, h, T, y):
         h1, logits = self.batched_fwd(params, x, h, T, 0.0, y)
-        loss = -y*log_softmax(logits, axis=1)
+        # Complex MSE instead of cross-entropy
+        loss = (logits - y) * jnp.conj(logits - y)
         loss = jnp.sum(loss, axis=1)
-        return jnp.mean(loss, axis=0), (logits, h1)
+        return jnp.mean(jnp.real(loss), axis=0), (logits, h1)
+
 
 
 
@@ -413,7 +429,7 @@ class xp_mlp:
     def train_step(self, params, batch, Ts, beta, lrs, algo, key):
         
         x, y = batch
-        y = one_hot(y, self.n_targets)
+        y = 2 * one_hot(y, self.n_targets) - 1
         T1, T2, N = Ts
         h = self.batched_init_neurons(x)
         
@@ -438,7 +454,7 @@ class xp_mlp:
     def eval_conv(self, params, x, y, h, beta, holo):
         h_next, _ = grad(self.jtphi, argnums=3, has_aux=True,
                          holomorphic=holo)(params, None, x, h, y, beta)
-        h_next = tree_map(self.act, h_next) 
+        # h_next = tree_map(self.act, h_next) 
         delta = tree_map(lambda a, b: a-b, h_next, h)
         return L2(delta, cplx=holo)
 
@@ -451,7 +467,6 @@ class xp_mlp:
 
 
     def evaluate(self, params, loader, T):
-        
         size = 0
         correct = 0
         loss = 0
@@ -459,12 +474,17 @@ class xp_mlp:
             size += x.shape[0]
             label = y
             y = one_hot(y, self.n_targets)
+            y = 2*y - 1  # Bipolar encoding {-1, +1}
 
             h = self.batched_init_neurons(x)
             _, logits = self.batched_fwd(params, x, h, T, 0.0, y)
 
-            loss += jnp.sum(-y*log_softmax(logits, axis=1)).item()
-            pred = jnp.argmax(logits, axis=1)
+            # Complex MSE loss
+            mse = jnp.sum(jnp.real((logits - y) * jnp.conj(logits - y)), axis=1)
+            loss += jnp.sum(mse).item()
+            
+            # Prediction: argmax of real part (or magnitude)
+            pred = jnp.argmax(jnp.real(logits), axis=1)
             correct += jnp.sum(jnp.equal(pred, label)).item()
         
         acc = correct/size

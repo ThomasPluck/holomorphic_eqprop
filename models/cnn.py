@@ -21,8 +21,10 @@ from utils.data import printLog, split, split_batch, one_hot, par_one_hot
 from utils.custom import SfmPool
 
 
-
-
+def bipolar_one_hot(labels, n_classes):
+    """Encode labels as +1/-1 instead of 1/0"""
+    oh = one_hot(labels, n_classes)
+    return 2*oh - 1  # Maps {0,1} → {-1,+1}
 
 class Identity(hk.Module):
     def __init__(self, name=None):
@@ -46,7 +48,7 @@ class xent_phi(hk.Module):
         pools = []
         for i in range(self.convlen):
 
-            l_name = 'xent_phi/~/conv_'+str(i+1)
+            l_name = 'sl_xent_phi/~/conv_'+str(i+1)
 
             c = archi[l_name]['channel']
             k = archi[l_name]['kernel']
@@ -79,7 +81,7 @@ class xent_phi(hk.Module):
                 pools.append(SfmPool((2,2,1), (2,2,1), padding='VALID', T=Tmp))
                     
         for i in range(self.fclen): 
-            l_name = 'xent_phi/~/fc_'+str(i+1+self.convlen)
+            l_name = 'sl_xent_phi/~/fc_'+str(i+1+self.convlen)
             size = archi[l_name]['fc']
 
             if archi[l_name].get('binit') is not None:
@@ -102,48 +104,61 @@ class xent_phi(hk.Module):
     def __call__(self, x, h, y, beta):
         
         phi = 0.0
-        l = x, *h
+        l = [x, *h]
 
+        # Conv layers with Stuart-Landau amplitude stabilization
         for i in range(self.convlen):
             m = self.layers[i]
             p = self.pools[i]
-            phi = phi + jnp.sum( p( m( l[i] )) * l[i+1])
+            
+            z_next = l[i+1]
+            
+            # Amplitude stabilization: -Σ(|z|² - ½|z|⁴)
+            amplitude = jnp.sum(z_next * jnp.conj(z_next))
+            phi = phi - amplitude + 0.5 * amplitude**2
+            
+            # Bilinear coupling through conv + pool
+            phi = phi + jnp.sum(p(m(l[i])) * jnp.conj(z_next))
 
+        # FC layers with Stuart-Landau amplitude stabilization
         for i in range(self.convlen, len(self.layers)-1):
             m = self.layers[i]
-            phi = phi + jnp.sum( m( l[i].flatten() ) * l[i+1] )
+            
+            z_next = l[i+1]
+            
+            # Amplitude stabilization
+            amplitude = jnp.sum(z_next * jnp.conj(z_next))
+            phi = phi - amplitude + 0.5 * amplitude**2
+            
+            # Bilinear coupling
+            phi = phi + jnp.sum(m(l[i].flatten()) * jnp.conj(z_next))
 
-        # softmax readout
-        logits = self.layers[-1]( l[-1].flatten() )
-        xent = -y*log_softmax(logits)
+        # Output layer - softmax readout
+        logits = self.layers[-1](l[-1].flatten())
+        
+        # Complex MSE loss in rotating frame
+        loss = jnp.sum((logits - y) * (jnp.conj(logits) - jnp.conj(y)))
 
-        phi = phi - beta * jnp.sum(xent)
+        phi = phi - beta * loss
 
         return phi, logits
 
 
     def smart_init(self, x):
-
         out = []
-        
         for i in range(self.convlen):
             m = self.layers[i]
             p = self.pools[i]
-            x = self.act( p( m(x) ) )
+            x = self.act(p(m(x)))  # Keep activation here for reasonable init
             out.append(x)
-
+        
         x = x.flatten()
-
         for i in range(self.convlen, len(self.layers)-1):
             m = self.layers[i]
-            x = self.act( m(x) )
+            x = self.act(m(x))
             out.append(x)
-
+        
         return tuple(out)
-
-
-
-
 
 class xent_p_cnn:
 
@@ -260,7 +275,7 @@ class xent_p_cnn:
         for t in range(T):
             h, logits = grad(self.jtphi, has_aux=True, argnums=3,
                              holomorphic=holo)(params, None, x, h, y, beta)
-            h = tree_map(self.act, h) 
+            # h = tree_map(self.act, h) 
         
         return h, logits
 
@@ -478,9 +493,10 @@ class xent_p_cnn:
 
     def batched_loss(self, params, x, h, T, y):
         h1, logits = self.batched_fwd(params, x, h, T, 0.0, y)
-        loss = -y*log_softmax(logits, axis=1)
-        loss = jnp.sum(loss, axis=1)
-        return jnp.mean(loss, axis=0), (logits, h1)
+        # Complex MSE loss
+        loss = jnp.sum((logits - y) * jnp.conj(logits - y), axis=1)
+        return jnp.mean(jnp.real(loss), axis=0), (logits, h1)
+
 
 
 
@@ -520,7 +536,7 @@ class xent_p_cnn:
         
         x, y = batch
         labels = y 
-        y = one_hot(y, self.n_targets)
+        y = bipolar_one_hot(y, self.n_targets)
         T1, T2, N = Ts
 
         h = self.batched_init_neurons(x)
@@ -611,11 +627,11 @@ class xent_p_cnn:
             args = cparam, cx, *args[2:]
         if self.n_devices>1:
             px, py = split(args[1]), split(args[2])
-            py = par_one_hot(py, self.n_targets)
+            py = 2 * par_one_hot(py, self.n_targets) - 1
             args = args[0], px, py, *args[3:]
             return self.parallel_eval_conv(*args)
         else:
-            y = one_hot(args[2], self.n_targets)
+            y = bipolar_one_hot(args[2], self.n_targets)
             args = args[0], args[1], y, *args[3:]
             return self.batched_eval_conv(*args)
 
@@ -632,7 +648,7 @@ class xent_p_cnn:
         if self.n_devices == 1:
             size = x.shape[0]
             label = y
-            y = one_hot(y, self.n_targets)
+            y = bipolar_one_hot(y, self.n_targets)
 
             h = self.batched_init_neurons(x)
             _, logits = self.batched_fwd(params, x, h, T, 0.0, y)
@@ -649,7 +665,7 @@ class xent_p_cnn:
         else:
             size = x.shape[0]
             label = y
-            y = one_hot(y, self.n_targets)
+            y = bipolar_one_hot(y, self.n_targets)
 
             x, y, label = split(x), split(y), split(label)
     
